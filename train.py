@@ -17,6 +17,9 @@ import torch.backends.cudnn as cudnn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+from experiment_config import (ANCHOR_SCALES, MODEL_BACKBONE,
+                               MODEL_IMAGE_SIZE, MODEL_TAG,
+                               PRETRAINED_WEIGHT_PATH)
 from nets.frcnn import FasterRCNN
 from nets.frcnn_training import (FasterRCNNTrainer, get_lr_scheduler,
                                  set_optimizer_lr, weights_init)
@@ -50,8 +53,7 @@ if __name__ == "__main__":
     # 不再依赖 VOC XML、VOCdevkit、2007_train.txt 或 2007_val.txt。
     # ------------------------------------------------------------------ #
     DATASET_ROOT    = Path(r"E:\YOLO\faster-rcnn\datasets\mydatasets")
-    PRETRAINED_WEIGHT_PATH = Path(r"E:\YOLO\faster-rcnn\weights\voc_weights_resnet.pth")
-    OUTPUT_DIR      = Path(r"E:\YOLO\faster-rcnn\output\faster_rcnn_resnet50_hdc_240epochs_640")
+    OUTPUT_DIR      = Path(r"E:\YOLO\faster-rcnn\output\faster_rcnn_resnet50_hdc_240epochs_512")
 
     #-------------------------------#
     #   是否使用Cuda
@@ -100,12 +102,12 @@ if __name__ == "__main__":
     #------------------------------------------------------#
     #   input_shape     输入的shape大小
     #------------------------------------------------------#
-    input_shape     = [640, 640]
+    input_shape     = [MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE]
     #---------------------------------------------#
     #   vgg
     #   resnet50
     #---------------------------------------------#
-    backbone        = "resnet50"
+    backbone        = MODEL_BACKBONE
     #----------------------------------------------------------------------------------------------------------------------------#
     #   pretrained      是否使用主干网络的预训练权重，此处使用的是主干的权重，因此是在模型构建的时候进行加载的。
     #                   如果设置了model_path，则主干的权值无需加载，pretrained的值无意义。
@@ -123,7 +125,7 @@ if __name__ == "__main__":
     #   如果想要检测小物体，可以减小anchors_size靠前的数。
     #   比如设置anchors_size = [4, 16, 32]
     #------------------------------------------------------------------------#
-    anchors_size    = [8, 16, 32]
+    anchors_size    = ANCHOR_SCALES
 
     #----------------------------------------------------------------------------------------------------------------------------#
     #   训练分为两个阶段，分别是冻结阶段和解冻阶段。设置冻结阶段是为了满足机器性能不足的同学的训练需求。
@@ -254,8 +256,8 @@ if __name__ == "__main__":
     if model_path and not Path(model_path).is_file():
         raise FileNotFoundError(
             f"Missing compatible pretrained weight: {model_path}\n"
-            "This repository requires voc_weights_resnet.pth. The TorchVision "
-            "Faster R-CNN ResNet50-FPN V2 COCO weight is not architecture-compatible."
+            f"当前共享模型为 {MODEL_TAG}，必须使用与 {backbone} 骨干兼容的本仓库权重；"
+            "TorchVision Faster R-CNN-FPN 权重与本仓库结构不兼容。"
         )
 
     #------------------------------------------------------#
@@ -264,6 +266,7 @@ if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"]  = ','.join(str(x) for x in train_gpu)
     ngpus_per_node                      = len(train_gpu)
     print('Number of devices: {}'.format(ngpus_per_node))
+    print(f'Shared model configuration: {MODEL_TAG}, input={MODEL_IMAGE_SIZE}')
     seed_everything(seed)
     
     model = FasterRCNN(num_classes, anchor_scales = anchors_size, backbone = backbone, pretrained = pretrained)
@@ -418,7 +421,8 @@ if __name__ == "__main__":
         #----------------------#
         eval_callback   = EvalCallback(model_train, input_shape, class_names, num_classes, val_lines, log_dir, Cuda, \
                                         max_boxes=300, confidence=0.001, nms_iou=0.7, \
-                                        eval_flag=eval_flag, period=eval_period)
+                                        eval_flag=eval_flag, period=eval_period, \
+                                        annotation_json=DATASET_ROOT / "val" / "annotations" / "val.json")
 
         #---------------------------------------#
         #   开始模型训练

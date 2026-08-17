@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from .utils import cvtColor, resize_image, preprocess_input, get_new_img_size
 from .utils_bbox import DecodeBox
-from .utils_map import get_coco_map, get_map
+from .utils_map import get_coco_map
 
 class LossHistory():
     def __init__(self, log_dir, model, input_shape):
@@ -79,7 +79,7 @@ class LossHistory():
 
 class EvalCallback():
     def __init__(self, net, input_shape, class_names, num_classes, val_lines, log_dir, cuda, \
-            map_out_path=".temp_map_out", max_boxes=100, confidence=0.05, nms_iou=0.5, letterbox_image=True, MINOVERLAP=0.5, eval_flag=True, period=1):
+            map_out_path=".temp_map_out", max_boxes=100, confidence=0.05, nms_iou=0.5, letterbox_image=True, MINOVERLAP=0.5, eval_flag=True, period=1, annotation_json=None):
         super(EvalCallback, self).__init__()
         
         self.net                = net
@@ -97,6 +97,8 @@ class EvalCallback():
         self.MINOVERLAP         = MINOVERLAP
         self.eval_flag          = eval_flag
         self.period             = period
+        self.annotation_json    = annotation_json
+        self.val_ground_truth   = self._load_coco_ground_truth(annotation_json)
         
         self.std    = torch.Tensor([0.1, 0.1, 0.2, 0.2]).repeat(self.num_classes + 1)[None]
         if self.cuda:
@@ -111,6 +113,40 @@ class EvalCallback():
             with open(os.path.join(self.log_dir, "epoch_map.txt"), 'a') as f:
                 f.write(str(0))
                 f.write("\n")
+
+    def _load_coco_ground_truth(self, annotation_json):
+        """读取验证集原始 COCO 浮点框，供训练期 AP50 选权重使用。"""
+        if annotation_json is None:
+            raise ValueError("训练期验证必须提供 val.json，禁止使用取整后的临时真值框。")
+        with open(annotation_json, encoding="utf-8") as file:
+            payload = json.load(file)
+        category_to_index = {}
+        for category in payload.get("categories", []):
+            name = category["name"]
+            if name not in self.class_names:
+                raise ValueError(f"val.json 类别 {name!r} 不在 classes.txt 中。")
+            category_to_index[int(category["id"])] = self.class_names.index(name)
+        annotations_by_image = {}
+        for annotation in payload.get("annotations", []):
+            annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
+        ground_truth = {}
+        for image in payload.get("images", []):
+            boxes = []
+            for annotation in annotations_by_image.get(int(image["id"]), []):
+                left, top, width, height = map(float, annotation["bbox"])
+                boxes.append(
+                    [
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        category_to_index[int(annotation["category_id"])],
+                    ]
+                )
+            ground_truth[image["file_name"].casefold()] = boxes
+        if not ground_truth:
+            raise ValueError(f"val.json 没有图像记录：{annotation_json}")
+        return ground_truth
 
     #---------------------------------------------------#
     #   检测图片
@@ -168,13 +204,16 @@ class EvalCallback():
         for i, c in list(enumerate(top_label)):
             predicted_class = self.class_names[int(c)]
             box             = top_boxes[i]
-            score           = str(top_conf[i])
+            score           = float(top_conf[i])
 
             top, left, bottom, right = box
             if predicted_class not in class_names:
                 continue
 
-            f.write("%s %s %s %s %s %s\n" % (predicted_class, score[:6], str(int(left)), str(int(top)), str(int(right)),str(int(bottom))))
+            f.write(
+                "%s %.10f %.10f %.10f %.10f %.10f\n"
+                % (predicted_class, score, left, top, right, bottom)
+            )
 
         f.close()
         return 
@@ -205,7 +244,10 @@ class EvalCallback():
                 #------------------------------#
                 #   获得预测框
                 #------------------------------#
-                gt_boxes    = np.array([np.array(list(map(int,box.split(',')))) for box in line[1:]])
+                image_name  = os.path.basename(line[0]).casefold()
+                if image_name not in self.val_ground_truth:
+                    raise KeyError(f"验证影像不在 val.json 中：{line[0]}")
+                gt_boxes    = self.val_ground_truth[image_name]
                 #------------------------------#
                 #   获得预测txt
                 #------------------------------#
@@ -218,17 +260,19 @@ class EvalCallback():
                     for box in gt_boxes:
                         left, top, right, bottom, obj = box
                         obj_name = self.class_names[obj]
-                        new_f.write("%s %s %s %s %s\n" % (obj_name, left, top, right, bottom))
+                        new_f.write(
+                            "%s %.10f %.10f %.10f %.10f\n"
+                            % (obj_name, left, top, right, bottom)
+                        )
             for module, was_training in module_training_states:
                 module.training = was_training
             with open(os.path.join(self.map_out_path, "image_sizes.json"), "w", encoding="utf-8") as f:
                 json.dump(image_sizes, f, ensure_ascii=False)
                         
             print("Calculate Map.")
-            try:
-                temp_map = get_coco_map(class_names = self.class_names, path = self.map_out_path)[1]
-            except:
-                temp_map = get_map(self.MINOVERLAP, False, path = self.map_out_path)
+            # 论文权重选择固定使用 COCO AP50。评价失败必须直接报错，禁止静默
+            # 回退到 VOC mAP 后仍将权重误标为 COCO best_map50。
+            temp_map = get_coco_map(class_names = self.class_names, path = self.map_out_path)[1]
             temp_map = float(temp_map)
             map50_improved = temp_map > self.best_map50
             if map50_improved:

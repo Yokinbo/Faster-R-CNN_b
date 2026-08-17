@@ -9,6 +9,7 @@ converts normalized YOLO ``class cx cy width height`` labels to the pixel-space
 from __future__ import annotations
 
 import math
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -195,3 +196,72 @@ def build_yolo_annotation_lines(
         negative_images=negative_count,
     )
     return annotation_lines, summary
+
+
+def build_coco_annotation_lines(
+    dataset_root: Path, split: str, class_names: List[str],
+) -> Tuple[List[str], YoloDatasetSummary]:
+    """从已有 COCO JSON 构造评估记录，保留原始浮点框，不覆盖任何标签。"""
+    split_root = Path(dataset_root).resolve() / split
+    annotation_path = split_root / "annotations" / f"{split}.json"
+    if not annotation_path.is_file():
+        raise FileNotFoundError(f"Missing COCO annotation: {annotation_path}")
+    payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+    category_to_index = {}
+    for category in payload.get("categories", []):
+        name = category["name"]
+        if name not in class_names:
+            raise ValueError(f"COCO category {name!r} is absent from classes.txt")
+        category_to_index[int(category["id"])] = class_names.index(name)
+
+    annotations_by_image = {}
+    for annotation in payload.get("annotations", []):
+        annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
+
+    annotation_lines = []
+    object_count = 0
+    negative_count = 0
+    seen_names = set()
+    for image in payload.get("images", []):
+        image_name = image["file_name"]
+        if image_name.casefold() in seen_names:
+            raise ValueError(f"Duplicate COCO image filename: {image_name}")
+        seen_names.add(image_name.casefold())
+        image_path = (split_root / "images" / image_name).resolve()
+        if not image_path.is_file():
+            raise FileNotFoundError(f"COCO image does not exist: {image_path}")
+        if any(char.isspace() for char in str(image_path)):
+            raise ValueError(f"Evaluation path cannot contain whitespace: {image_path}")
+
+        boxes = []
+        for annotation in annotations_by_image.get(int(image["id"]), []):
+            category_id = int(annotation["category_id"])
+            if category_id not in category_to_index:
+                raise ValueError(f"Unknown COCO category id: {category_id}")
+            left, top, width, height = map(float, annotation["bbox"])
+            if width <= 0 or height <= 0:
+                raise ValueError(f"Invalid COCO bbox: {annotation}")
+            boxes.append(
+                ",".join(
+                    [
+                        f"{left:.10f}",
+                        f"{top:.10f}",
+                        f"{left + width:.10f}",
+                        f"{top + height:.10f}",
+                        str(category_to_index[category_id]),
+                    ]
+                )
+            )
+        if not boxes:
+            negative_count += 1
+        object_count += len(boxes)
+        annotation_lines.append(" ".join([str(image_path), *boxes]) + "\n")
+
+    if not annotation_lines:
+        raise ValueError(f"No images found in COCO annotation: {annotation_path}")
+    return annotation_lines, YoloDatasetSummary(
+        split=split,
+        images=len(annotation_lines),
+        objects=object_count,
+        negative_images=negative_count,
+    )
